@@ -288,6 +288,146 @@ void FlushJob::Cancel() {
   base_->Unref();
 }
 
+void InMemCompaction() {
+  AutoThreadOperationStageUpdater stage_updater(
+      ThreadStatus::STAGE_FLUSH_WRITE_L0);
+  db_mutex_->AssertHeld();
+  const uint64_t start_micros = db_options_.env->NowMicros();
+  const uint64_t start_cpu_micros = db_options_.env->NowCPUNanos() / 1000;
+  Status s;
+  {
+    auto write_hint = cfd_->CalculateSSTWriteHint(0);
+    db_mutex_->Unlock();
+    if (log_buffer_) {
+      log_buffer_->FlushBufferToLog();
+    }
+    // memtables and range_del_iters store internal iterators over each data
+    // memtable and its associated range deletion memtable, respectively, at
+    // corresponding indexes.
+    std::vector<InternalIterator*> memtables;
+    std::vector<std::unique_ptr<FragmentedRangeTombstoneIterator>>
+        range_del_iters;
+    ReadOptions ro;
+    ro.total_order_seek = true;
+    Arena arena;
+    uint64_t total_num_entries = 0, total_num_deletes = 0;
+    uint64_t total_data_size = 0;
+    size_t total_memory_usage = 0;
+    for (MemTable* m : mems_) {
+      ROCKS_LOG_INFO(
+          db_options_.info_log,
+          "[%s] [JOB %d] Flushing memtable with next log file: %" PRIu64 "\n",
+          cfd_->GetName().c_str(), job_context_->job_id, m->GetNextLogNumber());
+      memtables.push_back(m->NewIterator(ro, &arena));
+      auto* range_del_iter =
+          m->NewRangeTombstoneIterator(ro, kMaxSequenceNumber);
+      if (range_del_iter != nullptr) {
+        range_del_iters.emplace_back(range_del_iter);
+      }
+      total_num_entries += m->num_entries();
+      total_num_deletes += m->num_deletes();
+      total_data_size += m->get_data_size();
+      total_memory_usage += m->ApproximateMemoryUsage();
+    }
+
+    event_logger_->Log() << "job" << job_context_->job_id << "event"
+                         << "flush_started"
+                         << "num_memtables" << mems_.size() << "num_entries"
+                         << total_num_entries << "num_deletes"
+                         << total_num_deletes << "total_data_size"
+                         << total_data_size << "memory_usage"
+                         << total_memory_usage << "flush_reason"
+                         << GetFlushReasonString(cfd_->GetFlushReason());
+
+    {
+      ScopedArenaIterator iter(
+          NewMergingIterator(&cfd_->internal_comparator(), &memtables[0],
+                             static_cast<int>(memtables.size()), &arena));
+      ROCKS_LOG_INFO(db_options_.info_log,
+                     "[%s] [JOB %d] Level-0 flush table #%" PRIu64 ": started",
+                     cfd_->GetName().c_str(), job_context_->job_id,
+                     meta_.fd.GetNumber());
+
+      TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table:output_compression",
+                               &output_compression_);
+      int64_t _current_time = 0;
+      auto status = db_options_.env->GetCurrentTime(&_current_time);
+      // Safe to proceed even if GetCurrentTime fails. So, log and proceed.
+      if (!status.ok()) {
+        ROCKS_LOG_WARN(
+            db_options_.info_log,
+            "Failed to get current time to populate creation_time property. "
+            "Status: %s",
+            status.ToString().c_str());
+      }
+      const uint64_t current_time = static_cast<uint64_t>(_current_time);
+
+      uint64_t oldest_key_time =
+          mems_.front()->ApproximateOldestKeyTime();
+
+      s = BuildMemTable(
+          dbname_, db_options_.env, *cfd_->ioptions(), mutable_cf_options_,
+          env_options_, cfd_->table_cache(), iter.get(),
+          std::move(range_del_iters), &meta_, cfd_->internal_comparator(),
+          cfd_->int_tbl_prop_collector_factories(), cfd_->GetID(),
+          cfd_->GetName(), existing_snapshots_,
+          earliest_write_conflict_snapshot_, snapshot_checker_,
+          output_compression_, mutable_cf_options_.sample_for_compression,
+          cfd_->ioptions()->compression_opts,
+          mutable_cf_options_.paranoid_file_checks, cfd_->internal_stats(),
+          TableFileCreationReason::kFlush, event_logger_, job_context_->job_id,
+          Env::IO_HIGH, &table_properties_, 0 /* level */, current_time,
+          oldest_key_time, write_hint, current_time);
+      LogFlush(db_options_.info_log);
+    }
+    ROCKS_LOG_INFO(db_options_.info_log,
+                   "[%s] [JOB %d] Level-0 flush table #%" PRIu64 ": %" PRIu64
+                   " bytes %s"
+                   "%s",
+                   cfd_->GetName().c_str(), job_context_->job_id,
+                   meta_.fd.GetNumber(), meta_.fd.GetFileSize(),
+                   s.ToString().c_str(),
+                   meta_.marked_for_compaction ? " (needs compaction)" : "");
+
+    if (s.ok() && output_file_directory_ != nullptr && sync_output_directory_) {
+      s = output_file_directory_->Fsync();
+    }
+    TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table", &mems_);
+    db_mutex_->Lock();
+  }
+  base_->Unref();
+
+  // Note that if file_size is zero, the file has been deleted and
+  // should not be added to the manifest.
+  if (s.ok() && meta_.fd.GetFileSize() > 0) {
+    // if we have more than 1 background thread, then we cannot
+    // insert files directly into higher levels because some other
+    // threads could be concurrently producing compacted files for
+    // that key range.
+    // Add file to L0
+    edit_->AddFile(0 /* level */, meta_.fd.GetNumber(), meta_.fd.GetPathId(),
+                   meta_.fd.GetFileSize(), meta_.smallest, meta_.largest,
+                   meta_.fd.smallest_seqno, meta_.fd.largest_seqno,
+                   meta_.marked_for_compaction);
+  }
+#ifndef ROCKSDB_LITE
+  // Piggyback FlushJobInfo on the first first flushed memtable.
+  mems_[0]->SetFlushJobInfo(GetFlushJobInfo());
+#endif  // !ROCKSDB_LITE
+
+  // Note that here we treat flush as level 0 compaction in internal stats
+  InternalStats::CompactionStats stats(CompactionReason::kFlush, 1);
+  stats.micros = db_options_.env->NowMicros() - start_micros;
+  stats.cpu_micros = db_options_.env->NowCPUNanos() / 1000 - start_cpu_micros;
+  stats.bytes_written = meta_.fd.GetFileSize();
+  RecordTimeToHistogram(stats_, FLUSH_TIME, stats.micros);
+  cfd_->internal_stats()->AddCompactionStats(0 /* level */, thread_pri_, stats);
+  cfd_->internal_stats()->AddCFStats(InternalStats::BYTES_FLUSHED,
+                                     meta_.fd.GetFileSize());
+  RecordFlushIOStats();
+  return s;
+}
+
 Status FlushJob::WriteLevel0Table() {
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_FLUSH_WRITE_L0);
